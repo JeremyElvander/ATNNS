@@ -12,8 +12,6 @@ import pickle
 from concurrent.futures import ProcessPoolExecutor
 
 class NeuralSystem():
-    def __init__(self, name, **kwargs):
-        self.name = name
     
     def prediction(self, data, phase=None, actual=None, seed=None):
         '''
