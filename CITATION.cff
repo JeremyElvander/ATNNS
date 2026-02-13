@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If this repository is used in other research or work, please cite it as below."
+authors:
+- family-names: "Elvander"
+  given-names: "J."
+- family-names: "Wexler"
+  given-names: "A. S."
+title: "eaim_moe_neuralnet: A Python Implementation for Inorganic Aerosol Thermodynamic Approximations"
+version: 1.0.0
+doi: 10.5281/zenodo.xxxxxxx
+date-released: 2026-02-12
+url: "https://github.com/JeremyElvander/eaim_moe_neuralnet"

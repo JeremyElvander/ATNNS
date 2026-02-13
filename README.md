@@ -19,7 +19,22 @@ Results from this project highlight how domain-aware routing and physics-informe
 
 ## Citation
 
-...
+If this repository is used in other research or work, please cite it as:
+
+Elvander, J. and Wexler, A. S.: eaim_moe_neuralnet: A Python Implementation for Inorganic Aerosol Thermodynamic Approximations, Zenodo [code], 10.5281/zenodo.xxxxxxx, 2026.
+
+'''bibtex
+@software{elvanderwexler2026eaim,
+  author       = {Elvander, J. and Wexler, A. S.},
+  title        = {{eaim_moe_neuralnet: A Python Implementation for Inorganic Aerosol Thermodynamic Approximations}},
+  month        = feb,
+  year         = 2026,
+  publisher    = {Zenodo},
+  version      = {v1.0.0},
+  doi          = {10.5281/zenodo.xxxxxxx},
+  url          = {https://github.com/JeremyElvander/eaim_moe_neuralnet}
+}
+
 
 ## Installation
 
@@ -63,6 +78,8 @@ EX: {'TEMP': [mean, std],
 
 Example data, and data used for training, is provided in the data subdirectory.
 
+## License
 
+This work is licensed under the Creative Commons Attribution 4.0 International license.
 
 
