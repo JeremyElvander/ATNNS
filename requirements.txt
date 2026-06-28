@@ -1,12 +1,13 @@
 # Core numeric + IO
-numpy>=1.23
+numpy>=1.23,<2
 pandas>=1.5
 pyarrow>=11.0.0
 
 # ML / inference
-tensorflow==2.13.0
-keras==2.13.1
+tensorflow>=2.16
+keras>=3.0
 h5py>=3.8
+protobuf>=3.20,<5
 
 # Modeling / metrics
 scikit-learn>=1.2

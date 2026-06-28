@@ -12,6 +12,8 @@ import pickle
 from concurrent.futures import ProcessPoolExecutor
 
 class ATNNS():
+    def __init__(self, windows=False):
+        self.windows = windows
 
     def prediction(self, data):
         '''
@@ -243,6 +245,7 @@ class ATNNS():
 
         Output: unscaled outputs
         '''
+        outputs = outputs.astype('float64')
         cols = outputs.columns
         #Ammonium Nitrate
         if 'amm_nit' in cols:
@@ -308,8 +311,255 @@ class ATNNS():
         file_path = current_dir / 'models' / model_name
         #Load and return model
         if keras:
-            model = tf.keras.models.load_model(file_path, compile=False)
+            if not self.windows:
+                model = tf.keras.models.load_model(file_path, compile=False)
+                return model
+            import zipfile, json, tempfile, os, io, re
+            import h5py
+
+            def _strip_batch_input_shape(obj):
+                # Keras 3 does not accept batch_input_shape on Dense layers (Keras 2 artifact)
+                if isinstance(obj, dict):
+                    if obj.get('class_name') != 'InputLayer':
+                        inner = obj.get('config')
+                        if isinstance(inner, dict):
+                            inner.pop('batch_input_shape', None)
+                    for v in obj.values():
+                        _strip_batch_input_shape(v)
+                elif isinstance(obj, list):
+                    for item in obj:
+                        _strip_batch_input_shape(item)
+
+            def _fix_h5_paths(weights_bytes):
+                # tensorflow-macos numbers H5 layer groups as dense, dense_2, dense_4...
+                # Keras 3 on Windows expects dense, dense_1, dense_2...
+                # This renames them sequentially without modifying files on disk.
+                with h5py.File(io.BytesIO(weights_bytes), 'r') as orig:
+                    if '_layer_checkpoint_dependencies' not in orig:
+                        return weights_bytes
+                    orig_lcp = orig['_layer_checkpoint_dependencies']
+                    groups = sorted(orig_lcp.keys(), key=lambda n: int(re.search(r'_(\d+)$', n).group(1)) if re.search(r'_(\d+)$', n) else 0)
+                    new_buf = io.BytesIO()
+                    with h5py.File(new_buf, 'w') as new:
+                        for key in orig.keys():
+                            if key != '_layer_checkpoint_dependencies':
+                                orig.copy(key, new)
+                        new_lcp = new.create_group('_layer_checkpoint_dependencies')
+                        for i, old_name in enumerate(groups):
+                            new_name = 'dense' if i == 0 else f'dense_{i}'
+                            orig_lcp.copy(old_name, new_lcp, name=new_name)
+                    return new_buf.getvalue()
+
+            import keras as _keras
+            keras_major = int(_keras.__version__.split('.')[0])
+            with zipfile.ZipFile(file_path, 'r') as zf:
+                config = json.loads(zf.read('config.json'))
+                _strip_batch_input_shape(config)
+                weights = zf.read('model.weights.h5')
+                if keras_major >= 3:
+                    weights = _fix_h5_paths(weights)
+                fd, tmp_path = tempfile.mkstemp(suffix='.keras')
+                os.close(fd)
+                try:
+                    with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as out_zf:
+                        out_zf.writestr('config.json', json.dumps(config))
+                        out_zf.writestr('model.weights.h5', weights)
+                        for name in zf.namelist():
+                            if name not in ('config.json', 'model.weights.h5'):
+                                out_zf.writestr(name, zf.read(name))
+                    model = tf.keras.models.load_model(tmp_path, compile=False)
+                finally:
+                    os.unlink(tmp_path)
             return model
         with open(file_path, 'rb') as file:
             model = pickle.load(file)
             return model
+
+
+class ATNNS_GPU(ATNNS):
+    def __init__(self, windows=False):
+        '''
+        '''
+        super().__init__(windows=windows)
+        
+        #Retrieve keras networks
+        self.models = {
+            'phase_classifier_nonzero': self._load_model('phase_classifier_nonzero.keras'),
+            'phase_classifier_zero': self._load_model('phase_classifier_zero.keras'),
+            'liqmix_amm_chl_nonzero': self._load_model('liqmix_amm_chl_nonzero.keras'),
+            'liqmix_amm_nit_nonzero': self._load_model('liqmix_amm_nit_nonzero.keras'),
+            'liqmix_water_content_nonzero': self._load_model('liqmix_water_content_nonzero.keras'),
+            'liqmix_water_content_zero': self._load_model('liqmix_water_content_zero.keras'),
+        }
+
+        #Retrieve and save solid regression constants to Tensors
+        #Ammonium Nitrate
+        solid_amm_nit_nonzero = self._load_model('solid_amm_nit_nonzero.pkl', keras=False)
+        self.solid_nit_a = tf.constant(np.exp(solid_amm_nit_nonzero.intercept_), dtype=tf.float32)
+        self.solid_nit_b = tf.constant(solid_amm_nit_nonzero.coef_[0], dtype=tf.float32)
+        
+        #Ammonium Chloride
+        solid_amm_chl_nonzero = self._load_model('solid_amm_chl_nonzero.pkl', keras=False)
+        self.solid_chl_a = tf.constant(np.exp(solid_amm_chl_nonzero.intercept_), dtype=tf.float32)
+        self.solid_chl_b = tf.constant(solid_amm_chl_nonzero.coef_[0], dtype=tf.float32)
+        
+        #Preloading scalers
+        scaler_files = [
+            'liqmix_amm_chl_nonzero',
+            'liqmix_amm_nit_nonzero',
+            'liqmix_water_content_nonzero',
+            'liqmix_water_content_zero',
+            'phase_classifier_nonzero',
+            'phase_classifier_zero'
+        ]
+
+        self.scalers = {}
+        for scaler in scaler_files:
+            filename = scaler + '.json'
+            s = self._import_scalers(filename)
+
+            #Store mean and sd as tensors for fast math
+            self.scalers[scaler] = {
+                #[mean, std] tensor format for TEMP and RH
+                'TEMP_mean': tf.constant(s['TEMP'][0], dtype=tf.float32, shape=()),
+                'TEMP_std': tf.constant(s['TEMP'][1], dtype=tf.float32, shape=()),
+                'RH_mean': tf.constant(s['RH'][0], dtype=tf.float32, shape=()),
+                'RH_std': tf.constant(s['RH'][1], dtype=tf.float32, shape=()),
+            }
+    
+    #Decorator to compile logic into GPU graph
+    @tf.function
+    def gpu_prediction(self, input_tensor):
+        '''
+        '''
+
+        def scale_temp_rh(t, r, key):
+            '''
+            Helper function to apply temperature and RH scaling inside the graph structure.
+            '''
+            t_scaled = (t-self.scalers[key]['TEMP_mean']) / self.scalers[key]['TEMP_std']
+            r_scaled = (r-self.scalers[key]['RH_mean']) / self.scalers[key]['RH_std']
+
+            return t_scaled, r_scaled
+
+        #Extract necessary individual columns
+        nh4 = input_tensor[:, 2:3]
+        na = input_tensor[:, 3:4]
+        temp = input_tensor[:, 0:1]
+        rh = input_tensor[:, 1:2]
+
+        #Creating mask for NH4+ gate
+        nh4_present = nh4>0
+
+        #Set up scaling denominators, avoid dividing by zero by replacing NH4+ = 0 with 1 temporarily
+        safe_nh4 = tf.where(nh4==0, tf.ones_like(nh4), nh4)
+        safe_na = tf.where(na==0, tf.ones_like(na), na)
+
+        #Perform scaling on all chemical inputs
+        #NH4+ != 0 case, avoids NaN without partitioning data
+        chem_nz = input_tensor[:, 3:7] / safe_nh4
+        #NH4+ = 0 case for all inputs
+        chem_z = input_tensor[:, 4:7] / safe_na
+        
+
+        # NH4+ != 0 CASE
+        #Phase classification
+        t_phase_nz, r_phase_nz = scale_temp_rh(temp, rh, 'phase_classifier_nonzero')
+        phase_inputs_nz = tf.concat([t_phase_nz, r_phase_nz, chem_nz], axis=1)
+        phase_nz = tf.cast(self.models['phase_classifier_nonzero'](phase_inputs_nz) >= 0.5, tf.float32)
+
+        #Liquid/Mix amm_nit, amm_chl, and water content
+        t_lm_nit, r_lm_nit = scale_temp_rh(temp, rh, 'liqmix_amm_nit_nonzero')
+        liq_nit_nz = self.models['liqmix_amm_nit_nonzero'](tf.concat([t_lm_nit, r_lm_nit, chem_nz], axis=1))
+
+        t_lm_chl, r_lm_chl = scale_temp_rh(temp, rh, 'liqmix_amm_chl_nonzero')
+        liq_chl_nz = self.models['liqmix_amm_chl_nonzero'](tf.concat([t_lm_chl, r_lm_chl, chem_nz], axis=1))
+
+        t_lm_wc, r_lm_wc = scale_temp_rh(temp, rh, 'liqmix_water_content_nonzero')
+        liq_wc_nz = self.models['liqmix_water_content_nonzero'](tf.concat([t_lm_wc, r_lm_wc, chem_nz], axis=1))
+
+        #Solid case amm_nit, amm_chl, and water content
+        sol_nit_nz = self.solid_nit_a * tf.math.exp(self.solid_nit_b * (1 / temp))
+
+        sol_chl_nz = self.solid_chl_a * tf.math.exp(self.solid_chl_b * (1 / temp))
+
+        #0 for water content solid case
+        sol_wc_nz = tf.zeros_like(liq_wc_nz)
+
+        #Merging NH4+ != 0 liquid/mix and solid cases based on phase mask (0 = liquid/mix, 1 = solid)
+        #Creating mask, multiplying models by 0/1 to 'activate' correct results
+        is_solid_nz = tf.cast(phase_nz > 0, tf.float32)
+        result_nit_nz = (1 - is_solid_nz) * liq_nit_nz + (is_solid_nz * sol_nit_nz)
+        result_chl_nz = (1 - is_solid_nz) * liq_chl_nz + (is_solid_nz * sol_chl_nz)
+        result_wc_nz = (1 - is_solid_nz) * liq_wc_nz + (is_solid_nz * sol_wc_nz)
+
+
+        # NH4 == 0 CASE
+        #Phase classification
+        t_phase_z, r_phase_z = scale_temp_rh(temp, rh, 'phase_classifier_zero')
+        phase_inputs_z = tf.concat([t_phase_z, r_phase_z, chem_z], axis=1)
+        phase_z = tf.cast(self.models['phase_classifier_zero'](phase_inputs_z) >= 0.5, tf.float32)
+
+        #Liquid/mix water content prediction
+        t_lm_wc_z, r_lm_wc_z = scale_temp_rh(temp, rh, 'liqmix_water_content_zero')
+        liq_wc_z = self.models['liqmix_water_content_zero'](tf.concat([t_lm_wc_z, r_lm_wc_z, chem_z], axis=1))
+
+        #Merge NH4+ = 0 liquid/mix and solid cases (0 for solid case for water content), (for phase, 0 = liquid/mix, 1 = solid)
+        is_solid_z = tf.cast(phase_z > 0, tf.float32)
+        #Solid water content case is 0
+        result_wc_z = (1 - is_solid_z) * liq_wc_z
+
+        #Amm nit and amm chl results are 0
+        result_nit_z = tf.zeros_like(result_wc_z)
+        result_chl_z = tf.zeros_like(result_wc_z)
+
+
+        # MERGE ALL RESULTS AND UNDO SCALING
+        #Using original NH4+ mask to select correct outputs
+        mask = tf.cast(nh4_present, tf.float32)
+
+        final_phase = mask * phase_nz + (1 - mask) * phase_z
+        final_nit = mask * result_nit_nz + (1 - mask) * result_nit_z
+        final_chl = mask * result_chl_nz + (1 - mask) * result_chl_z
+        final_wc = mask * result_wc_nz + (1 - mask) * result_wc_z
+
+        scaled_outputs = tf.concat([final_phase, final_nit, final_chl, final_wc], axis=1)
+
+        #Convert scaled outputs to original values with original raw inputs
+        return self._gpu_conversion(input_tensor, scaled_outputs)
+        
+    
+    def _gpu_conversion(self, inputs, outputs):
+        '''
+        '''
+        temp = inputs[:, 0:1]
+        rh = inputs[:, 1:2]
+        nh4 = inputs[:, 2:3]
+
+        phase = outputs[:, 0:1]
+        amm_nit = outputs[:, 1:2]
+        amm_chl = outputs[:, 2:3]
+        water_content = outputs[:, 3:4]
+
+        #Unscaling amm_nit and amm_chl based on solid case
+        sol_factor_nit = self.solid_nit_a * tf.math.exp(self.solid_nit_b * (1 / temp))
+        unscaled_nit = tf.where(phase>0, amm_nit, amm_nit * sol_factor_nit)
+
+        sol_factor_chl = self.solid_chl_a * tf.math.exp(self.solid_chl_b * (1 / temp))
+        unscaled_chl = tf.where(phase>0, amm_chl, amm_chl * sol_factor_chl)
+
+        #Unscaling water content for both cases
+        rh_factor = rh / (1.0 - rh)
+
+        #Calculating ion sums for both conditions
+        ion_sum_nz = tf.reduce_sum(inputs[:, 2:7], axis=1, keepdims=True)
+        ion_sum_z = tf.reduce_sum(inputs[:, 3:7], axis=1, keepdims=True)
+
+        #Use mask to choose correct ion sum for each output
+        ion_sum = tf.where(nh4>0, ion_sum_nz, ion_sum_z)
+        unscaled_water_content = water_content * ion_sum * rh_factor
+
+        #Return Nx4 vector
+        return tf.concat([phase, unscaled_nit, unscaled_chl, unscaled_water_content], axis=1)
+
+        
